@@ -1,0 +1,34 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ListBucket",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::BUCKET",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": ["flow-logs/*", "processed/*", "scripts/*"]
+        }
+      }
+    },
+    {
+      "Sid": "ReadFlowLogsAndScript",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": ["arn:aws:s3:::BUCKET/flow-logs/*", "arn:aws:s3:::BUCKET/scripts/*"]
+    },
+    {
+      "Sid": "WriteEnrichedData",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+      "Resource": "arn:aws:s3:::BUCKET/processed/*"
+    },
+    {
+      "Sid": "ReadNetworkMap",
+      "Effect": "Allow",
+      "Action": "ssm:GetParameter",
+      "Resource": "arn:aws:ssm:REGION:ACCOUNT_ID:parameter/cross-az/subnet-map"
+    }
+  ]
+}

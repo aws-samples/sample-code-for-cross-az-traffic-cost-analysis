@@ -1,0 +1,17 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadNetworkTopology",
+      "Effect": "Allow",
+      "Action": ["ec2:DescribeSubnets", "ec2:DescribeNetworkInterfaces"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "WriteNetworkMap",
+      "Effect": "Allow",
+      "Action": "ssm:PutParameter",
+      "Resource": "arn:aws:ssm:REGION:ACCOUNT_ID:parameter/cross-az/subnet-map"
+    }
+  ]
+}

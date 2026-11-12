@@ -1,0 +1,78 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Lab only: two small EC2 instances in the AZ2 private subnets of VPC A and VPC B
+  (Networking Immersion Day multi-VPC stack) so there is cross-AZ traffic to measure.
+
+Parameters:
+  VPCAId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC A (10.0.0.0/16)
+  VPCBId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC B (10.1.0.0/16)
+  VPCAPrivateSubnetAZ2Id:
+    Type: AWS::EC2::Subnet::Id
+    Description: VPC A Private Subnet AZ2 (10.0.3.0/24)
+  VPCBPrivateSubnetAZ2Id:
+    Type: AWS::EC2::Subnet::Id
+    Description: VPC B Private Subnet AZ2 (10.1.3.0/24)
+  InstanceProfileName:
+    Type: String
+    Default: NetworkingWorkshopInstanceProfile
+    Description: Instance profile with AmazonSSMManagedInstanceCore (created by pre-requisites.yaml)
+  AMI:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64
+
+Resources:
+  ClientSecurityGroupA:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Cross-AZ demo client in VPC A (egress only)
+      VpcId: !Ref VPCAId
+      SecurityGroupEgress:
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: HTTPS for Systems Manager and package repositories }
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0, Description: HTTP for package repository mirrors }
+        - { IpProtocol: tcp, FromPort: 5201, ToPort: 5201, CidrIp: 10.0.0.0/8, Description: iperf3 to the lab servers }
+      Tags: [{ Key: Name, Value: cross-az-demo-client-a }]
+
+  ClientSecurityGroupB:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Cross-AZ demo client in VPC B (egress only)
+      VpcId: !Ref VPCBId
+      SecurityGroupEgress:
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: HTTPS for Systems Manager and package repositories }
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0, Description: HTTP for package repository mirrors }
+        - { IpProtocol: tcp, FromPort: 5201, ToPort: 5201, CidrIp: 10.0.0.0/8, Description: iperf3 to the lab servers }
+      Tags: [{ Key: Name, Value: cross-az-demo-client-b }]
+
+  ClientA:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AMI
+      InstanceType: t3.micro
+      IamInstanceProfile: !Ref InstanceProfileName
+      SubnetId: !Ref VPCAPrivateSubnetAZ2Id
+      PrivateIpAddress: 10.0.3.100
+      SecurityGroupIds: [!Ref ClientSecurityGroupA]
+      MetadataOptions: { HttpTokens: required }
+      Tags: [{ Key: Name, Value: "VPC A Private AZ2 Demo Client" }]
+
+  ClientB:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AMI
+      InstanceType: t3.micro
+      IamInstanceProfile: !Ref InstanceProfileName
+      SubnetId: !Ref VPCBPrivateSubnetAZ2Id
+      PrivateIpAddress: 10.1.3.100
+      SecurityGroupIds: [!Ref ClientSecurityGroupB]
+      MetadataOptions: { HttpTokens: required }
+      Tags: [{ Key: Name, Value: "VPC B Private AZ2 Demo Client" }]
+
+Outputs:
+  ClientAId:
+    Value: !Ref ClientA
+  ClientBId:
+    Value: !Ref ClientB

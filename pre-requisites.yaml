@@ -1,0 +1,27 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Lab prerequisite: IAM role and instance profile that let the lab EC2 instances register with
+  AWS Systems Manager, so Run Command works without SSH. Trimmed from the Networking Immersion Day
+  template (the workshop's S3 full access, flow-logs role and test bucket are not needed here).
+
+Resources:
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: NetworkingWorkshopEC2Role
+      Path: "/"
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: NetworkingWorkshopInstanceProfile
+      Path: "/"
+      Roles: [!Ref EC2Role]

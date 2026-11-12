@@ -1,0 +1,285 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Amazon Quick Sight data source (with its own scoped IAM role), dataset and dashboard for
+  cross-AZ traffic cost analysis (Step 7 of the blog post). Deploy once the Glue job has run
+  and the cross_az_analytics.flows view exists, whether you built Steps 1-6 in the console,
+  with the CLI or with vpc-analytics-stack.yaml (then pass AthenaWorkGroupName=cross-az-analytics).
+
+Parameters:
+  QuickSightUserArn:
+    Type: String
+    Description: >-
+      ARN of your QuickSight user, e.g. arn:aws:quicksight:us-east-1:111122223333:user/default/Admin/jane
+      (aws quicksight list-users --aws-account-id <id> --namespace default)
+    AllowedPattern: "^arn:aws[a-z-]*:quicksight:[a-z0-9-]+:[0-9]{12}:user/.+$"
+  AthenaWorkGroupName:
+    Type: String
+    Default: primary
+    AllowedPattern: "^[A-Za-z0-9._-]{1,128}$"
+    Description: Athena workgroup whose query result location is s3://<BucketName>/athena-results/
+  BucketName:
+    Type: String
+    AllowedPattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+    Description: The solution bucket, e.g. cross-az-analytics-111122223333-us-east-1
+  DatabaseName:
+    Type: String
+    Default: cross_az_analytics
+    AllowedPattern: "^[A-Za-z_][A-Za-z0-9_]{0,254}$"
+  ViewName:
+    Type: String
+    Default: flows
+    AllowedPattern: "^[A-Za-z_][A-Za-z0-9_]{0,254}$"
+    Description: Deduplicating Athena view created in Step 6 (sql/01-create-flows-view.sql)
+
+Resources:
+  # Role QuickSight assumes to run Athena queries (scoped to this solution's buckets)
+  QuickSightAthenaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: quicksight.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSQuicksightAthenaAccess
+      Policies:
+        - PolicyName: cross-az-s3-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Bucket
+                Effect: Allow
+                Action: [s3:ListBucket, s3:GetBucketLocation, s3:ListBucketMultipartUploads]
+                Resource: !Sub arn:${AWS::Partition}:s3:::${BucketName}
+              - Sid: ReadEnrichedData
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub arn:${AWS::Partition}:s3:::${BucketName}/processed/*
+              - Sid: AthenaQueryResults
+                Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:ListMultipartUploadParts, s3:AbortMultipartUpload]
+                Resource: !Sub arn:${AWS::Partition}:s3:::${BucketName}/athena-results/*
+
+  AthenaDataSource:
+    Type: AWS::QuickSight::DataSource
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSourceId: cross-az-athena
+      Name: cross-az-athena
+      Type: ATHENA
+      DataSourceParameters:
+        AthenaParameters:
+          WorkGroup: !Ref AthenaWorkGroupName
+          RoleArn: !GetAtt QuickSightAthenaRole.Arn
+      SslProperties: { DisableSsl: false }
+      Permissions:
+        - Principal: !Ref QuickSightUserArn
+          Actions:
+            - quicksight:DescribeDataSource
+            - quicksight:DescribeDataSourcePermissions
+            - quicksight:PassDataSource
+            - quicksight:UpdateDataSource
+            - quicksight:DeleteDataSource
+            - quicksight:UpdateDataSourcePermissions
+
+  CrossAzDataSet:
+    Type: AWS::QuickSight::DataSet
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSetId: cross-az-traffic
+      Name: Cross-AZ traffic by IP pair
+      ImportMode: DIRECT_QUERY
+      PhysicalTableMap:
+        CrossAzSql:
+          CustomSql:
+            Name: cross-az-traffic
+            DataSourceArn: !GetAtt AthenaDataSource.Arn
+            SqlQuery: !Sub |
+              SELECT
+                date_trunc('day', flow_hour) AS flow_day,
+                srcaddr, dstaddr,
+                src_subnet_name || COALESCE(' (' || src_resource || ')', '') AS src_subnet_name,
+                dst_subnet_name || COALESCE(' (' || dst_resource || ')', '') AS dst_subnet_name,
+                src_az_id, dst_az_id, traffic_path,
+                SUM(bytes) AS total_bytes,
+                SUM(bytes) / POWER(1024, 3) AS total_gb,
+                SUM(IF(traffic_path = 'Cross-AZ (same VPC)', bytes, 0)) / POWER(1024, 3) * 0.02 AS cross_az_transfer_usd,
+                SUM(IF(traffic_path = 'Inter-VPC (Transit Gateway)', bytes, 0)) / POWER(1024, 3) * 0.02 AS tgw_processing_usd
+              FROM ${DatabaseName}.${ViewName}
+              WHERE traffic_path <> 'External / unmonitored'
+              GROUP BY 1, 2, 3, 4, 5, 6, 7, 8
+              HAVING SUM(bytes) >= 1048576
+            Columns:
+              - { Name: flow_day, Type: DATETIME }
+              - { Name: srcaddr, Type: STRING }
+              - { Name: dstaddr, Type: STRING }
+              - { Name: src_subnet_name, Type: STRING }
+              - { Name: dst_subnet_name, Type: STRING }
+              - { Name: src_az_id, Type: STRING }
+              - { Name: dst_az_id, Type: STRING }
+              - { Name: traffic_path, Type: STRING }
+              - { Name: total_bytes, Type: INTEGER }
+              - { Name: total_gb, Type: DECIMAL }
+              - { Name: cross_az_transfer_usd, Type: DECIMAL }
+              - { Name: tgw_processing_usd, Type: DECIMAL }
+      Permissions:
+        - Principal: !Ref QuickSightUserArn
+          Actions:
+            - quicksight:DescribeDataSet
+            - quicksight:DescribeDataSetPermissions
+            - quicksight:PassDataSet
+            - quicksight:DescribeIngestion
+            - quicksight:ListIngestions
+            - quicksight:UpdateDataSet
+            - quicksight:DeleteDataSet
+            - quicksight:CreateIngestion
+            - quicksight:CancelIngestion
+            - quicksight:UpdateDataSetPermissions
+
+  CrossAzDashboard:
+    Type: AWS::QuickSight::Dashboard
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DashboardId: cross-az-traffic-dashboard
+      Name: Cross-AZ traffic cost
+      Permissions:
+        - Principal: !Ref QuickSightUserArn
+          Actions:
+            - quicksight:DescribeDashboard
+            - quicksight:ListDashboardVersions
+            - quicksight:UpdateDashboardPermissions
+            - quicksight:QueryDashboard
+            - quicksight:UpdateDashboard
+            - quicksight:DeleteDashboard
+            - quicksight:DescribeDashboardPermissions
+            - quicksight:UpdateDashboardPublishedVersion
+      DashboardPublishOptions:
+        AdHocFilteringOption: { AvailabilityStatus: ENABLED }
+        ExportToCSVOption: { AvailabilityStatus: ENABLED }
+        SheetControlsOption: { VisibilityState: EXPANDED }
+      Definition:
+        DataSetIdentifierDeclarations:
+          - Identifier: xaz
+            DataSetArn: !GetAtt CrossAzDataSet.Arn
+        Sheets:
+          - SheetId: cross-az-sheet
+            Name: Cross-AZ traffic
+            Layouts:
+              - Configuration:
+                  GridLayout:
+                    Elements:
+                      - { ElementId: kpi-cross-az-cost, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 9, RowIndex: 0, RowSpan: 6 }
+                      - { ElementId: kpi-tgw-cost, ElementType: VISUAL, ColumnIndex: 9, ColumnSpan: 9, RowIndex: 0, RowSpan: 6 }
+                      - { ElementId: bar-by-path, ElementType: VISUAL, ColumnIndex: 18, ColumnSpan: 18, RowIndex: 0, RowSpan: 6 }
+                      - { ElementId: heatmap-ip-pairs, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 6, RowSpan: 12 }
+                      - { ElementId: table-pairs, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 18, RowSpan: 10 }
+            Visuals:
+              - KPIVisual:
+                  VisualId: kpi-cross-az-cost
+                  Title: { Visibility: VISIBLE, FormatText: { PlainText: "Cross-AZ data transfer (USD)" } }
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField:
+                            FieldId: kpi-xaz-usd
+                            Column: { DataSetIdentifier: xaz, ColumnName: cross_az_transfer_usd }
+                            AggregationFunction: { SimpleNumericalAggregation: SUM }
+              - KPIVisual:
+                  VisualId: kpi-tgw-cost
+                  Title: { Visibility: VISIBLE, FormatText: { PlainText: "Transit Gateway processing (USD)" } }
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField:
+                            FieldId: kpi-tgw-usd
+                            Column: { DataSetIdentifier: xaz, ColumnName: tgw_processing_usd }
+                            AggregationFunction: { SimpleNumericalAggregation: SUM }
+              - HeatMapVisual:
+                  VisualId: heatmap-ip-pairs
+                  Title: { Visibility: VISIBLE, FormatText: { PlainText: "Traffic volume (GB): source IP to destination IP" } }
+                  ChartConfiguration:
+                    FieldWells:
+                      HeatMapAggregatedFieldWells:
+                        Rows:
+                          - CategoricalDimensionField:
+                              FieldId: hm-src
+                              Column: { DataSetIdentifier: xaz, ColumnName: srcaddr }
+                        Columns:
+                          - CategoricalDimensionField:
+                              FieldId: hm-dst
+                              Column: { DataSetIdentifier: xaz, ColumnName: dstaddr }
+                        Values:
+                          - NumericalMeasureField:
+                              FieldId: hm-gb
+                              Column: { DataSetIdentifier: xaz, ColumnName: total_gb }
+                              AggregationFunction: { SimpleNumericalAggregation: SUM }
+              - BarChartVisual:
+                  VisualId: bar-by-path
+                  Title: { Visibility: VISIBLE, FormatText: { PlainText: "Traffic volume (GB) by path" } }
+                  ChartConfiguration:
+                    Orientation: HORIZONTAL
+                    FieldWells:
+                      BarChartAggregatedFieldWells:
+                        Category:
+                          - CategoricalDimensionField:
+                              FieldId: bar-path
+                              Column: { DataSetIdentifier: xaz, ColumnName: traffic_path }
+                        Values:
+                          - NumericalMeasureField:
+                              FieldId: bar-gb
+                              Column: { DataSetIdentifier: xaz, ColumnName: total_gb }
+                              AggregationFunction: { SimpleNumericalAggregation: SUM }
+              - TableVisual:
+                  VisualId: table-pairs
+                  Title: { Visibility: VISIBLE, FormatText: { PlainText: "IP pairs: path, volume and estimated cost" } }
+                  ChartConfiguration:
+                    FieldWells:
+                      TableAggregatedFieldWells:
+                        GroupBy:
+                          - CategoricalDimensionField:
+                              FieldId: t-src
+                              Column: { DataSetIdentifier: xaz, ColumnName: srcaddr }
+                          - CategoricalDimensionField:
+                              FieldId: t-src-subnet
+                              Column: { DataSetIdentifier: xaz, ColumnName: src_subnet_name }
+                          - CategoricalDimensionField:
+                              FieldId: t-src-az
+                              Column: { DataSetIdentifier: xaz, ColumnName: src_az_id }
+                          - CategoricalDimensionField:
+                              FieldId: t-dst
+                              Column: { DataSetIdentifier: xaz, ColumnName: dstaddr }
+                          - CategoricalDimensionField:
+                              FieldId: t-dst-subnet
+                              Column: { DataSetIdentifier: xaz, ColumnName: dst_subnet_name }
+                          - CategoricalDimensionField:
+                              FieldId: t-dst-az
+                              Column: { DataSetIdentifier: xaz, ColumnName: dst_az_id }
+                          - CategoricalDimensionField:
+                              FieldId: t-path
+                              Column: { DataSetIdentifier: xaz, ColumnName: traffic_path }
+                        Values:
+                          - NumericalMeasureField:
+                              FieldId: t-gb
+                              Column: { DataSetIdentifier: xaz, ColumnName: total_gb }
+                              AggregationFunction: { SimpleNumericalAggregation: SUM }
+                          - NumericalMeasureField:
+                              FieldId: t-xaz
+                              Column: { DataSetIdentifier: xaz, ColumnName: cross_az_transfer_usd }
+                              AggregationFunction: { SimpleNumericalAggregation: SUM }
+                          - NumericalMeasureField:
+                              FieldId: t-tgw
+                              Column: { DataSetIdentifier: xaz, ColumnName: tgw_processing_usd }
+                              AggregationFunction: { SimpleNumericalAggregation: SUM }
+                    SortConfiguration:
+                      RowSort:
+                        - FieldSort: { FieldId: t-gb, Direction: DESC }
+
+Outputs:
+  DashboardUrl:
+    Value: !Sub https://${AWS::Region}.quicksight.aws.amazon.com/sn/dashboards/cross-az-traffic-dashboard
+  DataSetId:
+    Value: cross-az-traffic
+  QuickSightAthenaRoleArn:
+    Value: !GetAtt QuickSightAthenaRole.Arn

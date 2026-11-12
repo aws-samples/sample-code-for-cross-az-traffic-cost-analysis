@@ -1,0 +1,461 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Cross-AZ traffic analytics (Steps 1-4 of the blog post in one stack): one S3 bucket, VPC Flow Logs
+  (custom format, Parquet) for two VPCs, Lambda network map in SSM Parameter Store, hourly AWS Glue
+  enrichment job, and an Athena workgroup with the view and cost query as saved queries.
+  After deploying, upload cross-az-flowlogs-enrichment.py to s3://<bucket>/scripts/.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: "Networks to monitor" }
+        Parameters: [VPCAId, VPCBId]
+      - Label: { default: "Processing" }
+        Parameters: [ProcessingSchedule]
+
+Parameters:
+  VPCAId:
+    Type: AWS::EC2::VPC::Id
+    Description: First VPC to monitor (VPC A in the lab)
+  VPCBId:
+    Type: AWS::EC2::VPC::Id
+    Description: Second VPC to monitor (VPC B in the lab)
+  ProcessingSchedule:
+    Type: String
+    Default: cron(5 * * * ? *)
+    Description: When the Glue enrichment job runs (default 5 minutes past every hour, UTC)
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # One bucket: flow-logs/ (raw), processed/ (enriched), athena-results/, scripts/
+  # ---------------------------------------------------------------------------
+  AnalyticsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub cross-az-analytics-${AWS::AccountId}-${AWS::Region}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      VersioningConfiguration: { Status: Enabled }   # nothing here is overwritten, so this costs nothing
+      LoggingConfiguration: { LogFilePrefix: access-logs/ }   # server access logs, same bucket
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-raw-flow-logs
+            Status: Enabled
+            Prefix: flow-logs/
+            ExpirationInDays: 30
+            NoncurrentVersionExpiration: { NoncurrentDays: 1 }
+          - Id: expire-query-results
+            Status: Enabled
+            Prefix: athena-results/
+            ExpirationInDays: 7
+            NoncurrentVersionExpiration: { NoncurrentDays: 1 }
+          - Id: expire-access-logs
+            Status: Enabled
+            Prefix: access-logs/
+            ExpirationInDays: 90
+            NoncurrentVersionExpiration: { NoncurrentDays: 1 }
+          - Id: clean-up-versions-and-uploads
+            Status: Enabled
+            Prefix: ""
+            NoncurrentVersionExpiration: { NoncurrentDays: 7 }
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 7 }
+
+  AnalyticsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AnalyticsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # Same permissions the console adds when you create a flow log to S3.
+          # With Hive-compatible prefixes the key is flow-logs/AWSLogs/aws-account-id=<id>/...
+          - Sid: AWSLogDeliveryWrite
+            Effect: Allow
+            Principal: { Service: delivery.logs.amazonaws.com }
+            Action: s3:PutObject
+            Resource: !Sub ${AnalyticsBucket.Arn}/flow-logs/AWSLogs/*
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+                s3:x-amz-acl: bucket-owner-full-control
+              ArnLike:
+                aws:SourceArn: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*
+          - Sid: AWSLogDeliveryCheck
+            Effect: Allow
+            Principal: { Service: delivery.logs.amazonaws.com }
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt AnalyticsBucket.Arn
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*
+          - Sid: S3ServerAccessLogsWrite
+            Effect: Allow
+            Principal: { Service: logging.s3.amazonaws.com }
+            Action: s3:PutObject
+            Resource: !Sub ${AnalyticsBucket.Arn}/access-logs/*
+            Condition:
+              StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
+              ArnLike: { aws:SourceArn: !GetAtt AnalyticsBucket.Arn }
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !Sub "arn:${AWS::Partition}:s3:::${AnalyticsBucket}"
+              - !Sub "arn:${AWS::Partition}:s3:::${AnalyticsBucket}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  # ---------------------------------------------------------------------------
+  # VPC Flow Logs: custom format (23 fields, 9 of them required), Parquet, hourly Hive partitions
+  # ---------------------------------------------------------------------------
+  VPCAFlowLog:
+    Type: AWS::EC2::FlowLog
+    DependsOn: AnalyticsBucketPolicy
+    Properties:
+      ResourceType: VPC
+      ResourceId: !Ref VPCAId
+      TrafficType: ALL
+      LogDestinationType: s3
+      LogDestination: !Sub ${AnalyticsBucket.Arn}/flow-logs
+      MaxAggregationInterval: 60
+      LogFormat: "${version} ${account-id} ${region} ${vpc-id} ${subnet-id} ${az-id} ${instance-id} ${interface-id} ${srcaddr} ${dstaddr} ${srcport} ${dstport} ${pkt-srcaddr} ${pkt-dstaddr} ${protocol} ${packets} ${bytes} ${start} ${end} ${action} ${log-status} ${flow-direction} ${traffic-path}"
+      DestinationOptions:
+        FileFormat: parquet
+        HiveCompatiblePartitions: true
+        PerHourPartition: true
+      Tags:
+        - { Key: Name, Value: cross-az-analytics }
+
+  VPCBFlowLog:
+    Type: AWS::EC2::FlowLog
+    DependsOn: AnalyticsBucketPolicy
+    Properties:
+      ResourceType: VPC
+      ResourceId: !Ref VPCBId
+      TrafficType: ALL
+      LogDestinationType: s3
+      LogDestination: !Sub ${AnalyticsBucket.Arn}/flow-logs
+      MaxAggregationInterval: 60
+      LogFormat: "${version} ${account-id} ${region} ${vpc-id} ${subnet-id} ${az-id} ${instance-id} ${interface-id} ${srcaddr} ${dstaddr} ${srcport} ${dstport} ${pkt-srcaddr} ${pkt-dstaddr} ${protocol} ${packets} ${bytes} ${start} ${end} ${action} ${log-status} ${flow-direction} ${traffic-path}"
+      DestinationOptions:
+        FileFormat: parquet
+        HiveCompatiblePartitions: true
+        PerHourPartition: true
+      Tags:
+        - { Key: Name, Value: cross-az-analytics }
+
+  # ---------------------------------------------------------------------------
+  # Network map: CIDR -> {subnet_id, subnet_name, az_id, vpc_id} + NAT/TGW labels in Parameter Store.
+  # Runs once at deploy time (custom resource) and can be re-invoked any time.
+  # ---------------------------------------------------------------------------
+  SubnetMapperRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: cross-az-subnet-mapper
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadNetworkTopology
+                Effect: Allow
+                Action: [ec2:DescribeSubnets, ec2:DescribeNetworkInterfaces]   # no resource-level permissions
+                Resource: "*"
+              - Sid: WriteNetworkMap
+                Effect: Allow
+                Action: [ssm:PutParameter, ssm:DeleteParameter]
+                Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cross-az/subnet-map
+
+  SubnetMapperFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_115
+            comment: Invoked once per stack change or on demand; no concurrency to limit
+          - id: CKV_AWS_116
+            comment: Synchronous invocations only (custom resource, console Test, CLI invoke); failures surface to the caller
+          - id: CKV_AWS_117
+            comment: Calls only the EC2 and SSM APIs; no VPC resources to reach
+          - id: CKV_AWS_173
+            comment: Environment holds VPC IDs and a parameter name, not secrets
+    Properties:
+      FunctionName: cross-az-subnet-mapper
+      Description: Builds the CIDR -> subnet/AZ/VPC map used by the Glue enrichment job
+      Runtime: python3.14
+      Handler: index.handler
+      Timeout: 60
+      Role: !GetAtt SubnetMapperRole.Arn
+      Environment:
+        Variables:
+          VPC_IDS: !Sub ${VPCAId},${VPCBId}
+          PARAMETER_NAME: /cross-az/subnet-map
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+          import cfnresponse
+
+          ec2 = boto3.client("ec2")
+          ssm = boto3.client("ssm")
+          PARAM = os.environ["PARAMETER_NAME"]
+          LABELS = {"nat_gateway": "NAT gateway", "transit_gateway": "Transit Gateway ENI"}
+
+
+          def build_map():
+              vpc_ids = [v.strip() for v in os.environ["VPC_IDS"].split(",") if v.strip()]
+              vpc_filter = [{"Name": "vpc-id", "Values": vpc_ids}]
+              subnets = {}
+              for page in ec2.get_paginator("describe_subnets").paginate(Filters=vpc_filter):
+                  for s in page["Subnets"]:
+                      name = next((t["Value"] for t in s.get("Tags", []) if t["Key"] == "Name"), s["SubnetId"])
+                      subnets[s["CidrBlock"]] = {"subnet_id": s["SubnetId"], "subnet_name": name,
+                                                 "az_id": s["AvailabilityZoneId"], "vpc_id": s["VpcId"]}
+              # Label managed ENIs; Transit Gateway ENIs also need special handling in the Glue job
+              resources, tgw_ips = {}, []
+              eni_filter = vpc_filter + [{"Name": "interface-type", "Values": list(LABELS)}]
+              for page in ec2.get_paginator("describe_network_interfaces").paginate(Filters=eni_filter):
+                  for eni in page["NetworkInterfaces"]:
+                      ip = eni["PrivateIpAddress"]
+                      resources[ip] = LABELS[eni["InterfaceType"]]
+                      if eni["InterfaceType"] == "transit_gateway":
+                          tgw_ips.append(ip)
+              value = {"subnets": subnets, "resources": resources, "transit_gateway_ips": tgw_ips}
+              # Intelligent-Tiering moves to the advanced tier (8 KB) only if the map outgrows 4 KB
+              ssm.put_parameter(Name=PARAM, Value=json.dumps(value), Type="String",
+                                Tier="Intelligent-Tiering", Overwrite=True)
+              return {"parameter": PARAM, "subnets": len(subnets), "labelled_ips": len(resources),
+                      "transit_gateway_ips": len(tgw_ips)}
+
+
+          def handler(event, context):
+              # Invoked by CloudFormation (custom resource) or directly (aws lambda invoke / console Test)
+              if "RequestType" not in event:
+                  result = build_map()
+                  print(result)
+                  return result
+              try:
+                  if event["RequestType"] in ("Create", "Update"):
+                      result = build_map()
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {"Subnets": result["subnets"]}, PARAM)
+                  else:
+                      try:
+                          ssm.delete_parameter(Name=PARAM)
+                      except ssm.exceptions.ParameterNotFound:
+                          pass
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, PARAM)
+              except Exception as e:  # always answer CloudFormation so the stack never hangs
+                  print(f"Error: {e}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": str(e)}, PARAM)
+
+  SubnetMap:
+    Type: Custom::SubnetMap
+    Properties:
+      ServiceToken: !GetAtt SubnetMapperFunction.Arn
+      VpcIds: !Sub ${VPCAId},${VPCBId}
+      MapFormat: "2"   # bump to rebuild the map on stack update
+
+  # ---------------------------------------------------------------------------
+  # Glue: database, enrichment job (bookmarks on), hourly trigger
+  # ---------------------------------------------------------------------------
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: cross_az_analytics
+        Description: Enriched VPC Flow Logs for cross-AZ traffic analysis
+
+  GlueJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub CrossAzGlueJobRole-${AWS::Region}   # IAM names are account-wide: keeps a second Region deployable
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: glue.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: cross-az-glue-job
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ListBucket
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt AnalyticsBucket.Arn
+                Condition:
+                  StringLike:
+                    s3:prefix: [flow-logs/*, processed/*, scripts/*]
+              - Sid: ReadFlowLogsAndScript
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: [!Sub "${AnalyticsBucket.Arn}/flow-logs/*", !Sub "${AnalyticsBucket.Arn}/scripts/*"]
+              - Sid: WriteEnrichedData
+                Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:DeleteObject]
+                Resource: !Sub ${AnalyticsBucket.Arn}/processed/*
+              - Sid: ReadNetworkMap
+                Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cross-az/subnet-map
+
+  EnrichmentJob:
+    Type: AWS::Glue::Job
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_195
+            comment: Output is written to a bucket with SSE-S3 default encryption; a Glue security configuration would add KMS and a per-reader key decision
+    Properties:
+      Name: cross-az-flowlogs-enrichment
+      Description: Enriches VPC Flow Logs with AZ/VPC labels; per-observer bytes for cross-AZ cost analysis
+      Role: !GetAtt GlueJobRole.Arn
+      GlueVersion: "5.0"
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      Timeout: 30
+      MaxRetries: 0
+      ExecutionProperty: { MaxConcurrentRuns: 1 }
+      Command:
+        Name: glueetl
+        PythonVersion: "3"
+        ScriptLocation: !Sub s3://${AnalyticsBucket}/scripts/cross-az-flowlogs-enrichment.py
+      DefaultArguments:
+        --job-language: python
+        --job-bookmark-option: job-bookmark-enable
+        --enable-metrics: "true"
+        --flow_logs_path: !Sub s3://${AnalyticsBucket}/flow-logs/AWSLogs/
+        --output_path: !Sub s3://${AnalyticsBucket}/processed/flow_logs_enriched/
+        --database_name: !Ref GlueDatabase
+        --table_name: flow_logs_enriched
+        --ssm_parameter_name: /cross-az/subnet-map
+
+  HourlyTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Name: cross-az-flowlogs-hourly
+      Type: SCHEDULED
+      Schedule: !Ref ProcessingSchedule
+      StartOnCreation: true
+      Actions:
+        - JobName: !Ref EnrichmentJob
+
+  # ---------------------------------------------------------------------------
+  # Athena: own workgroup (leaves "primary" untouched) + saved queries
+  # ---------------------------------------------------------------------------
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: cross-az-analytics
+      Description: Workgroup for cross-AZ traffic analysis
+      State: ENABLED
+      RecursiveDeleteOption: true
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        BytesScannedCutoffPerQuery: 10737418240   # 10 GB guardrail per query
+        EngineVersion: { SelectedEngineVersion: "Athena engine version 3" }
+        ResultConfiguration:
+          OutputLocation: !Sub s3://${AnalyticsBucket}/athena-results/
+          EncryptionConfiguration: { EncryptionOption: SSE_S3 }
+
+  CreateFlowsViewQuery:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: create-flows-view
+      Description: Run once after the first Glue run - deduplicating view, one row per hour and IP pair
+      WorkGroup: !Ref AthenaWorkGroup
+      Database: !Ref GlueDatabase
+      QueryString: |
+        -- Each ENI on the path (client, Transit Gateway ENIs, NAT gateway, server) logs the same traffic.
+        -- Sum per observer, then take the MAX across observers: no double counting, and a flow still
+        -- counts if one observer skipped records or delivered them late.
+        CREATE OR REPLACE VIEW cross_az_analytics.flows AS
+        SELECT
+          year, month, day, flow_hour, srcaddr, dstaddr,
+          src_subnet_name, src_az_id, src_vpc_id, src_resource,
+          dst_subnet_name, dst_az_id, dst_vpc_id, dst_resource,
+          CASE
+            WHEN src_vpc_id IS NULL OR dst_vpc_id IS NULL THEN 'External / unmonitored'
+            WHEN src_vpc_id <> dst_vpc_id THEN 'Inter-VPC (Transit Gateway)'   -- change if you use VPC peering
+            WHEN src_az_id <> dst_az_id   THEN 'Cross-AZ (same VPC)'
+            ELSE 'Same AZ'
+          END AS traffic_path,
+          MAX(bytes) AS bytes,
+          COUNT(*)   AS observers
+        FROM (
+          SELECT year, month, day, flow_hour, srcaddr, dstaddr, interface_id,
+                 src_subnet_name, src_az_id, src_vpc_id, src_resource,
+                 dst_subnet_name, dst_az_id, dst_vpc_id, dst_resource,
+                 SUM(bytes) AS bytes
+          FROM cross_az_analytics.flow_logs_enriched
+          GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
+        )
+        GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
+
+  CrossAzCostQuery:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: cross-az-cost-by-ip-pair
+      Description: Cross-AZ and Transit Gateway cost per IP pair, last 30 days (us-east-1 rates)
+      WorkGroup: !Ref AthenaWorkGroup
+      Database: !Ref GlueDatabase
+      QueryString: |
+        -- Rates (us-east-1): cross-AZ $0.01/GB out + $0.01/GB in; Transit Gateway processing $0.02/GB.
+        -- Traffic that crosses AZs through a Transit Gateway has no cross-AZ data transfer charge.
+        SELECT
+          srcaddr, dstaddr,
+          src_subnet_name || COALESCE(' (' || src_resource || ')', '') AS source,
+          dst_subnet_name || COALESCE(' (' || dst_resource || ')', '') AS destination,
+          src_az_id, dst_az_id, traffic_path,
+          ROUND(SUM(bytes) / POWER(1024, 3), 3) AS total_gb,
+          ROUND(SUM(IF(traffic_path = 'Cross-AZ (same VPC)', bytes, 0)) / POWER(1024, 3) * 0.02, 4) AS cross_az_transfer_usd,
+          ROUND(SUM(IF(traffic_path = 'Inter-VPC (Transit Gateway)', bytes, 0)) / POWER(1024, 3) * 0.02, 4) AS tgw_processing_usd
+        FROM cross_az_analytics.flows
+        WHERE traffic_path <> 'External / unmonitored'
+          AND flow_hour >= current_timestamp - INTERVAL '30' DAY
+        GROUP BY 1, 2, 3, 4, 5, 6, 7
+        HAVING SUM(bytes) >= 1048576   -- hide pairs under 1 MiB
+        ORDER BY total_gb DESC
+        LIMIT 25;
+
+Outputs:
+  BucketName:
+    Description: Upload cross-az-flowlogs-enrichment.py to s3://<this bucket>/scripts/
+    Value: !Ref AnalyticsBucket
+  GlueJobName:
+    Value: !Ref EnrichmentJob
+  GlueDatabaseName:
+    Value: !Ref GlueDatabase
+  AthenaWorkGroupName:
+    Description: Pass as AthenaWorkGroupName to quicksight.yaml
+    Value: !Ref AthenaWorkGroup
+  SubnetMapParameter:
+    Value: /cross-az/subnet-map
+  SubnetMapperFunctionName:
+    Description: Re-run after adding or changing subnets
+    Value: !Ref SubnetMapperFunction
